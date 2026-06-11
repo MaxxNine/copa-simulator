@@ -15,6 +15,15 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "Simulador & Bolão Copa 2026",
   description: "Simule os resultados e faça seus palpites para a Copa do Mundo 2026!",
+  applicationName: "Copa 2026",
+  appleWebApp: {
+    capable: true,
+    title: "Copa 2026",
+    statusBarStyle: "default",
+  },
+  formatDetection: {
+    telephone: false,
+  },
 };
 
 export default function RootLayout({

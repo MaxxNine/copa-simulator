@@ -344,18 +344,15 @@ export async function getGroupMembers(groupId: string): Promise<UserProfile[]> {
  * live points for those matches and adds them to user points before sorting.
  */
 export async function getLeaderboard(groupId?: string): Promise<UserProfile[]> {
-  // 1. Fetch relevant users
-  let users: UserProfile[] = [];
-  if (groupId) {
-    users = await getGroupMembers(groupId);
-  } else {
-    const usersCol = collection(db, 'users');
-    const usersSnap = await getDocs(usersCol);
-    users = usersSnap.docs.map((d) => d.data() as UserProfile);
-  }
+  const usersPromise = groupId
+    ? getGroupMembers(groupId)
+    : getDocs(collection(db, "users")).then((snapshot) =>
+        snapshot.docs.map((document) => document.data() as UserProfile)
+      );
 
-  // 2. Fetch live matches to calculate potential live points
-  const allMatches = await getMatches();
+  // Member profiles and matches are independent, so fetch them together.
+  const [users, allMatches] = await Promise.all([usersPromise, getMatches()]);
+
   const liveMatches = allMatches.filter((m) => m.status === 'live');
 
   // If there are no live matches, simply sort by static points

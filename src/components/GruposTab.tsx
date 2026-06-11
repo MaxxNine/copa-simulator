@@ -9,6 +9,17 @@ interface GruposTabProps {
   currentUser: UserProfile | null;
 }
 
+const GROUPS_TIMEOUT_MS = 12_000;
+
+function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      window.setTimeout(() => reject(new Error(message)), GROUPS_TIMEOUT_MS);
+    }),
+  ]);
+}
+
 export default function GruposTab({ currentUser }: GruposTabProps) {
   // State for user groups
   const [groups, setGroups] = useState<Group[]>([]);
@@ -22,88 +33,97 @@ export default function GruposTab({ currentUser }: GruposTabProps) {
   // Status states
   const [isLoading, setIsLoading] = useState(false);
   const [isLeaderboardLoading, setIsLeaderboardLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [copiedCode, setCopiedCode] = useState(false);
   const [activeSubTab, setActiveSubTab] = useState<'my_groups' | 'create_join'>('my_groups');
 
-  // Load user groups or seed mock groups
+  // Load user groups
   useEffect(() => {
+    let cancelled = false;
+
     async function loadGroups() {
-      setIsLoading(true);
-      try {
-        if (currentUser) {
-          const userGroups = await getUserGroups(currentUser.id);
-          setGroups(userGroups);
-          if (userGroups.length > 0) {
-            setSelectedGroup(userGroups[0]);
-          }
-        } else {
-          // Mock groups for presentation
-          const mockGroups: Group[] = [
-            {
-              id: 'g1',
-              name: 'Amigos do Futebol',
-              creatorId: 'u1',
-              inviteCode: 'HEXA26',
-              members: ['u1', 'u2', 'u3', 'u4']
-            },
-            {
-              id: 'g2',
-              name: 'Turma do Trabalho',
-              creatorId: 'u2',
-              inviteCode: 'WORK26',
-              members: ['u1', 'u2', 'u5']
-            }
-          ];
-          setGroups(mockGroups);
-          setSelectedGroup(mockGroups[0]);
-        }
-      } catch (err) {
-        console.error('Error fetching groups:', err);
-      } finally {
+      if (!currentUser) {
+        setGroups([]);
+        setSelectedGroup(null);
         setIsLoading(false);
+        return;
+      }
+
+      setIsLoading(true);
+      setLoadError(null);
+      try {
+        const userGroups = await withTimeout(
+          getUserGroups(currentUser.id),
+          "A conexão demorou demais para carregar os grupos."
+        );
+        if (cancelled) return;
+
+        setGroups(userGroups);
+        setSelectedGroup((current) =>
+          userGroups.find((group) => group.id === current?.id) ??
+          userGroups[0] ??
+          null
+        );
+      } catch (error) {
+        console.error("Error fetching groups:", error);
+        if (!cancelled) {
+          setLoadError(
+            error instanceof Error
+              ? error.message
+              : "Não foi possível carregar os grupos."
+          );
+        }
+      } finally {
+        if (!cancelled) setIsLoading(false);
       }
     }
-    loadGroups();
-  }, [currentUser]);
+
+    void loadGroups();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentUser, reloadKey]);
 
   // Load group leaderboard when selectedGroup changes
   useEffect(() => {
+    let cancelled = false;
+
     async function loadLeaderboard() {
-      if (!selectedGroup) return;
-      setIsLeaderboardLoading(true);
-      try {
-        if (currentUser) {
-          const board = await getLeaderboard(selectedGroup.id);
-          setGroupLeaderboard(board);
-        } else {
-          // Mock ranking for selected mock groups
-          const mockRanking: Record<string, UserProfile[]> = {
-            'g1': [
-              { id: 'u1', displayName: 'Gabriel Maxx', email: '', role: 'admin', totalPoints: 34, stats: { exactScores: 4, correctResults: 7 } },
-              { id: 'u2', displayName: 'Alice Silva', email: '', role: 'user', totalPoints: 29, stats: { exactScores: 3, correctResults: 7 } },
-              { id: 'u3', displayName: 'Bruno Santos', email: '', role: 'user', totalPoints: 28, stats: { exactScores: 2, correctResults: 9 } },
-              { id: 'u4', displayName: 'Clara Costa', email: '', role: 'user', totalPoints: 24, stats: { exactScores: 2, correctResults: 7 } }
-            ],
-            'g2': [
-              { id: 'u2', displayName: 'Alice Silva', email: '', role: 'user', totalPoints: 29, stats: { exactScores: 3, correctResults: 7 } },
-              { id: 'u1', displayName: 'Gabriel Maxx', email: '', role: 'admin', totalPoints: 34, stats: { exactScores: 4, correctResults: 7 } },
-              { id: 'u5', displayName: 'Diego Souza', email: '', role: 'user', totalPoints: 19, stats: { exactScores: 1, correctResults: 8 } }
-            ]
-          };
-          
-          // Sort mock rankings manually by points
-          const ranking = (mockRanking[selectedGroup.id] || []).sort((a, b) => b.totalPoints - a.totalPoints);
-          setGroupLeaderboard(ranking);
-        }
-      } catch (err) {
-        console.error('Error loading group leaderboard:', err);
-      } finally {
+      if (!selectedGroup || !currentUser) {
+        setGroupLeaderboard([]);
         setIsLeaderboardLoading(false);
+        return;
+      }
+
+      setIsLeaderboardLoading(true);
+      setLoadError(null);
+      try {
+        const board = await withTimeout(
+          getLeaderboard(selectedGroup.id),
+          "A conexão demorou demais para carregar a classificação."
+        );
+        if (!cancelled) setGroupLeaderboard(board);
+      } catch (error) {
+        console.error("Error loading group leaderboard:", error);
+        if (!cancelled) {
+          setLoadError(
+            error instanceof Error
+              ? error.message
+              : "Não foi possível carregar a classificação."
+          );
+        }
+      } finally {
+        if (!cancelled) setIsLeaderboardLoading(false);
       }
     }
-    loadLeaderboard();
-  }, [selectedGroup, currentUser]);
+
+    void loadLeaderboard();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedGroup, currentUser, reloadKey]);
 
   const handleCopyCode = (code: string) => {
     navigator.clipboard.writeText(code);
@@ -262,7 +282,23 @@ export default function GruposTab({ currentUser }: GruposTabProps) {
           {/* Groups Sidebar Selector */}
           <div className="lg:col-span-4 space-y-3">
             <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Lista de Grupos</h3>
-            {groups.length === 0 ? (
+            {isLoading && groups.length === 0 ? (
+              <div className="bg-white rounded-2xl border border-slate-100 p-6 text-center shadow-sm">
+                <RefreshCw className="mx-auto animate-spin text-blue-600 h-6 w-6 mb-2" />
+                <p className="text-xs text-slate-500">Carregando grupos...</p>
+              </div>
+            ) : loadError && groups.length === 0 ? (
+              <div className="bg-white rounded-2xl border border-red-100 p-6 text-center shadow-sm">
+                <AlertCircle className="mx-auto text-red-500 h-7 w-7 mb-2" />
+                <p className="text-xs text-red-700 font-semibold">{loadError}</p>
+                <button
+                  onClick={() => setReloadKey((key) => key + 1)}
+                  className="text-xs text-blue-600 font-bold hover:underline mt-3"
+                >
+                  Tentar novamente
+                </button>
+              </div>
+            ) : groups.length === 0 ? (
               <div className="bg-white rounded-2xl border border-slate-100 p-6 text-center shadow-sm">
                 <Users className="mx-auto text-slate-350 h-8 w-8 mb-2" />
                 <p className="text-xs text-slate-500 font-medium">Nenhum grupo ativo.</p>
@@ -340,7 +376,18 @@ export default function GruposTab({ currentUser }: GruposTabProps) {
                     Classificação do Grupo
                   </h3>
 
-                  {isLeaderboardLoading ? (
+                  {loadError && groupLeaderboard.length === 0 && !isLeaderboardLoading ? (
+                    <div className="flex flex-col items-center justify-center py-10 text-center">
+                      <AlertCircle className="text-red-500 h-6 w-6 mb-2" />
+                      <p className="text-xs text-red-700 font-semibold">{loadError}</p>
+                      <button
+                        onClick={() => setReloadKey((key) => key + 1)}
+                        className="text-xs text-blue-600 font-bold hover:underline mt-3"
+                      >
+                        Tentar novamente
+                      </button>
+                    </div>
+                  ) : isLeaderboardLoading ? (
                     <div className="flex flex-col items-center justify-center py-10">
                       <RefreshCw className="animate-spin text-blue-600 h-6 w-6 mb-2" />
                       <p className="text-xs text-slate-500">Atualizando classificação do grupo...</p>

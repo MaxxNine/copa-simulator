@@ -12,7 +12,18 @@ import ClassificacaoTab from '../../components/ClassificacaoTab';
 import RankingTab from '../../components/RankingTab';
 import GruposTab from '../../components/GruposTab';
 import AdminTab from '../../components/AdminTab';
-import { Trophy, Award, Users, ShieldAlert, LogOut, Compass, Menu, X } from 'lucide-react';
+import { Trophy, Award, Users, ShieldAlert, LogOut, Compass, Menu, X, AlertCircle } from 'lucide-react';
+
+const DATA_TIMEOUT_MS = 12_000;
+
+function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      window.setTimeout(() => reject(new Error(message)), DATA_TIMEOUT_MS);
+    }),
+  ]);
+}
 
 export default function Dashboard() {
   const router = useRouter();
@@ -20,6 +31,7 @@ export default function Dashboard() {
   // Auth state
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState<string | null>(null);
 
   // App data state
   const [matches, setMatches] = useState<Match[]>([]);
@@ -32,92 +44,110 @@ export default function Dashboard() {
 
   // 1. Listen to Authentication State
   useEffect(() => {
+    let unsubscribeUserDoc: (() => void) | undefined;
+    let disposed = false;
+
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      unsubscribeUserDoc?.();
+      unsubscribeUserDoc = undefined;
+
       if (!firebaseUser) {
-        // Redirect to Login if unauthenticated
         setAuthLoading(false);
-        router.push('/');
+        router.push("/");
         return;
       }
 
-      // Session Expiry Check & Sliding Window
       const now = Date.now();
-      const savedExpiry = localStorage.getItem('simwc_session_expiry');
+      const savedExpiry = localStorage.getItem("simwc_session_expiry");
       if (savedExpiry) {
         const expiry = parseInt(savedExpiry, 10);
         if (now > expiry) {
-          // Session expired
           await signOut(auth);
-          localStorage.removeItem('simwc_session_expiry');
+          localStorage.removeItem("simwc_session_expiry");
           setAuthLoading(false);
-          router.push('/');
+          router.push("/");
           return;
-        } else {
-          // Sliding window: set to 15 days from now
-          const newExpiry = now + 15 * 24 * 60 * 60 * 1000;
-          localStorage.setItem('simwc_session_expiry', newExpiry.toString());
         }
+        localStorage.setItem(
+          "simwc_session_expiry",
+          (now + 15 * 24 * 60 * 60 * 1000).toString()
+        );
       } else {
-        // Safe-guard fallback: initialize to 30 days
-        localStorage.setItem('simwc_session_expiry', (now + 30 * 24 * 60 * 60 * 1000).toString());
+        localStorage.setItem(
+          "simwc_session_expiry",
+          (now + 30 * 24 * 60 * 60 * 1000).toString()
+        );
       }
 
       try {
-        // Fetch or create profile
-        const profile = await createUserProfile(
-          firebaseUser.uid,
-          firebaseUser.displayName || 'Usuário Copa',
-          firebaseUser.email || ''
+        setAuthError(null);
+        const profile = await withTimeout(
+          createUserProfile(
+            firebaseUser.uid,
+            firebaseUser.displayName || "Usuário Copa",
+            firebaseUser.email || ""
+          ),
+          "Tempo limite ao carregar o perfil."
         );
 
+        if (disposed) return;
         setCurrentUser(profile);
-        
-        // Listen to changes on user document in real-time (to update points, etc.)
-        const userRef = doc(db, 'users', firebaseUser.uid);
-        const unsubUserDoc = onSnapshot(userRef, (docSnap) => {
-          if (docSnap.exists()) {
+        setAuthLoading(false);
+
+        const userRef = doc(db, "users", firebaseUser.uid);
+        unsubscribeUserDoc = onSnapshot(userRef, (docSnap) => {
+          if (!disposed && docSnap.exists()) {
             setCurrentUser(docSnap.data() as UserProfile);
           }
         });
 
-        // Load matches and user's predictions
-        await loadData(firebaseUser.uid, profile.role);
+        void (async () => {
+          setIsDataLoading(true);
+          try {
+            if (profile.role === "admin") {
+              await withTimeout(
+                checkAndSeedMatches(),
+                "Tempo limite ao verificar partidas."
+              );
+            }
 
-        setAuthLoading(false);
-        return () => unsubUserDoc();
+            const [allMatches, userPreds] = await withTimeout(
+              Promise.all([
+                getMatches(),
+                getUserPredictions(firebaseUser.uid),
+              ]),
+              "Tempo limite ao carregar os dados."
+            );
+
+            if (!disposed) {
+              setMatches(allMatches);
+              setPredictions(userPreds);
+            }
+          } catch (error) {
+            console.error("Error loading matches/predictions:", error);
+          } finally {
+            if (!disposed) setIsDataLoading(false);
+          }
+        })();
       } catch (err) {
-        console.error('Error in authentication sync:', err);
-        setAuthLoading(false);
+        console.error("Error in authentication sync:", err);
+        if (!disposed) {
+          setAuthError(
+            err instanceof Error
+              ? err.message
+              : "Não foi possível conectar ao servidor."
+          );
+          setAuthLoading(false);
+        }
       }
     });
 
-    return () => unsubscribe();
+    return () => {
+      disposed = true;
+      unsubscribe();
+      unsubscribeUserDoc?.();
+    };
   }, [router]);
-
-  // Load matches and predictions from Firestore
-  const loadData = async (uid: string, role?: string) => {
-    setIsDataLoading(true);
-    try {
-      // Seed if matches are empty (only allowed for admins)
-      if (role === 'admin') {
-        // Wait 600ms to allow Firestore indexing/replica propagation of the new user doc
-        await new Promise((resolve) => setTimeout(resolve, 600));
-        await checkAndSeedMatches();
-      }
-      
-      // Load all matches
-      const allMatches = await getMatches();
-      setMatches(allMatches);
-
-      // Load predictions
-      const userPreds = await getUserPredictions(uid);
-      setPredictions(userPreds);
-    } catch (e) {
-      console.error('Error loading matches/predictions:', e);
-    } finally {
-      setIsDataLoading(false);
-    }
-  };
 
   // Sync predictions after saving in child components
   const handlePredictionSaved = (matchId: string, homeScore: number, awayScore: number, locked?: boolean) => {
@@ -153,6 +183,22 @@ export default function Dashboard() {
       console.error('Logout failed:', e);
     }
   };
+
+  if (authError) {
+    return (
+      <div className="flex min-h-screen flex-col items-center justify-center bg-slate-50 px-6 text-center">
+        <AlertCircle className="mb-3 h-9 w-9 text-red-500" />
+        <h1 className="text-lg font-black text-slate-900">Falha ao carregar sua conta</h1>
+        <p className="mt-2 max-w-sm text-sm text-slate-500">{authError}</p>
+        <button
+          onClick={() => window.location.reload()}
+          className="mt-5 rounded-xl bg-blue-600 px-5 py-3 text-sm font-bold text-white"
+        >
+          Tentar novamente
+        </button>
+      </div>
+    );
+  }
 
   if (authLoading) {
     return (

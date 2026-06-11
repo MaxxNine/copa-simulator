@@ -483,6 +483,11 @@ export async function getUserPredictions(userId: string): Promise<Record<string,
  * The first successfully created snapshot is preserved on every retry.
  */
 export async function createMatchSnapshot(matchId: string): Promise<void> {
+  const snapshotRef = doc(db, 'prediction_snapshots', matchId);
+  if ((await getDoc(snapshotRef)).exists()) {
+    return;
+  }
+
   const sheetsCol = collection(db, 'prediction_sheets');
   const sheetsSnap = await getDocs(sheetsCol);
 
@@ -531,7 +536,6 @@ export async function createMatchSnapshot(matchId: string): Promise<void> {
     }
   });
 
-  const snapshotRef = doc(db, 'prediction_snapshots', matchId);
   const created = await runTransaction(db, async (transaction) => {
     const existingSnapshot = await transaction.get(snapshotRef);
     if (existingSnapshot.exists()) {

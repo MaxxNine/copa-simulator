@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Group, UserProfile } from '../types';
 import { createGroup, joinGroup, getUserGroups, getLeaderboard } from '../lib/db';
 import { Users, Plus, Key, Copy, Check, ChevronRight, Award, Trophy, UserPlus, AlertCircle, RefreshCw } from 'lucide-react';
@@ -10,6 +10,7 @@ interface GruposTabProps {
 }
 
 const GROUPS_TIMEOUT_MS = 12_000;
+const LEADERBOARD_CACHE_MS = 60_000;
 
 function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
   return Promise.race([
@@ -38,6 +39,9 @@ export default function GruposTab({ currentUser }: GruposTabProps) {
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [copiedCode, setCopiedCode] = useState(false);
   const [activeSubTab, setActiveSubTab] = useState<'my_groups' | 'create_join'>('my_groups');
+  const leaderboardCache = useRef(
+    new Map<string, { data: UserProfile[]; loadedAt: number }>()
+  );
 
   // Load user groups
   useEffect(() => {
@@ -97,6 +101,13 @@ export default function GruposTab({ currentUser }: GruposTabProps) {
         return;
       }
 
+      const cached = leaderboardCache.current.get(selectedGroup.id);
+      if (cached && Date.now() - cached.loadedAt < LEADERBOARD_CACHE_MS) {
+        setGroupLeaderboard(cached.data);
+        setIsLeaderboardLoading(false);
+        return;
+      }
+
       setIsLeaderboardLoading(true);
       setLoadError(null);
       try {
@@ -104,7 +115,13 @@ export default function GruposTab({ currentUser }: GruposTabProps) {
           getLeaderboard(selectedGroup.id),
           "A conexão demorou demais para carregar a classificação."
         );
-        if (!cancelled) setGroupLeaderboard(board);
+        if (!cancelled) {
+          leaderboardCache.current.set(selectedGroup.id, {
+            data: board,
+            loadedAt: Date.now(),
+          });
+          setGroupLeaderboard(board);
+        }
       } catch (error) {
         console.error("Error loading group leaderboard:", error);
         if (!cancelled) {
@@ -125,6 +142,11 @@ export default function GruposTab({ currentUser }: GruposTabProps) {
     };
   }, [selectedGroup, currentUser, reloadKey]);
 
+  const handleRetry = () => {
+    leaderboardCache.current.clear();
+    setReloadKey((key) => key + 1);
+  };
+
   const handleCopyCode = (code: string) => {
     navigator.clipboard.writeText(code);
     setCopiedCode(true);
@@ -140,6 +162,7 @@ export default function GruposTab({ currentUser }: GruposTabProps) {
     try {
       if (currentUser) {
         const newGroup = await createGroup(createName, currentUser.id);
+        leaderboardCache.current.delete(newGroup.id);
         setGroups(prev => [...prev, newGroup]);
         setSelectedGroup(newGroup);
         setMessage({ type: 'success', text: `Grupo "${createName}" criado com sucesso! Código: ${newGroup.inviteCode}` });
@@ -178,6 +201,8 @@ export default function GruposTab({ currentUser }: GruposTabProps) {
       if (currentUser) {
         const joined = await joinGroup(joinCode.toUpperCase(), currentUser.id);
         
+        leaderboardCache.current.delete(joined.id);
+
         // Add to state if not already present
         setGroups(prev => {
           if (prev.some(g => g.id === joined.id)) return prev;
@@ -292,7 +317,7 @@ export default function GruposTab({ currentUser }: GruposTabProps) {
                 <AlertCircle className="mx-auto text-red-500 h-7 w-7 mb-2" />
                 <p className="text-xs text-red-700 font-semibold">{loadError}</p>
                 <button
-                  onClick={() => setReloadKey((key) => key + 1)}
+                  onClick={handleRetry}
                   className="text-xs text-blue-600 font-bold hover:underline mt-3"
                 >
                   Tentar novamente
@@ -381,7 +406,7 @@ export default function GruposTab({ currentUser }: GruposTabProps) {
                       <AlertCircle className="text-red-500 h-6 w-6 mb-2" />
                       <p className="text-xs text-red-700 font-semibold">{loadError}</p>
                       <button
-                        onClick={() => setReloadKey((key) => key + 1)}
+                        onClick={handleRetry}
                         className="text-xs text-blue-600 font-bold hover:underline mt-3"
                       >
                         Tentar novamente

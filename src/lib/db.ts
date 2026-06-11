@@ -8,11 +8,12 @@ import {
   updateDoc,
   query,
   where,
-  orderBy,
   limit,
-  writeBatch
+  writeBatch,
+  documentId,
+  runTransaction
 } from 'firebase/firestore';
-import { UserProfile, Match, Prediction, Group } from '../types';
+import { UserProfile, Match, Prediction, Group, PredictionSheet, PredictionSnapshot } from '../types';
 import { generateGroupStageMatches, MATCHES_SEED_VERSION } from '../utils/seeds/matchesSeed';
 import { calculatePoints } from '../utils/points';
 
@@ -97,10 +98,10 @@ export async function checkAndSeedMatches(): Promise<void> {
     matches.forEach((m) => {
       statuses[m.id] = m.status;
     });
-    await setDoc(docRef, { 
-      list: matches, 
+    await setDoc(docRef, {
+      list: matches,
       statuses,
-      seedVersion: MATCHES_SEED_VERSION 
+      seedVersion: MATCHES_SEED_VERSION
     });
     console.log(`Seeded matches single-document with ${matches.length} Portuguese matches and statuses map.`);
   }
@@ -112,14 +113,14 @@ export async function checkAndSeedMatches(): Promise<void> {
 export async function getMatches(): Promise<Match[]> {
   const docRef = doc(db, 'matches', 'all_matches');
   const docSnap = await getDoc(docRef);
-  
+
   if (docSnap.exists()) {
     const data = docSnap.data();
     const list = (data.list as Match[]) || [];
     // Sort matches by date
     return list.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
   }
-  
+
   return [];
 }
 
@@ -128,27 +129,71 @@ export async function getMatches(): Promise<Match[]> {
  */
 export async function updateMatchInSingleDoc(matchId: string, updates: Partial<Match>): Promise<void> {
   const docRef = doc(db, 'matches', 'all_matches');
-  const docSnap = await getDoc(docRef);
-  
-  if (docSnap.exists()) {
+  await runTransaction(db, async (transaction) => {
+    const docSnap = await transaction.get(docRef);
+    if (!docSnap.exists()) {
+      throw new Error('Documento de partidas não encontrado.');
+    }
+
     const data = docSnap.data();
     const list = (data.list as Match[]) || [];
-    const statuses = (data.statuses as Record<string, string>) || {};
-    
-    const updatedList = list.map(m => 
-      m.id === matchId ? { ...m, ...updates } : m
+    if (!list.some((match) => match.id === matchId)) {
+      throw new Error('Partida não encontrada.');
+    }
+
+    const statuses = {
+      ...((data.statuses as Record<string, Match['status']>) || {})
+    };
+    const updatedList = list.map((match) =>
+      match.id === matchId ? { ...match, ...updates } : match
     );
-    
+
     if (updates.status) {
       statuses[matchId] = updates.status;
     }
-    
-    await setDoc(docRef, { 
+
+    transaction.set(docRef, {
       ...data,
-      list: updatedList, 
-      statuses 
+      list: updatedList,
+      statuses
     });
-  }
+  });
+}
+
+async function transitionMatchStatus(
+  matchId: string,
+  allowedStatuses: Match['status'][],
+  updates: Partial<Match>
+): Promise<void> {
+  const docRef = doc(db, 'matches', 'all_matches');
+  await runTransaction(db, async (transaction) => {
+    const docSnap = await transaction.get(docRef);
+    if (!docSnap.exists()) {
+      throw new Error('Documento de partidas não encontrado.');
+    }
+
+    const data = docSnap.data();
+    const list = (data.list as Match[]) || [];
+    const currentMatch = list.find((match) => match.id === matchId);
+    if (!currentMatch) {
+      throw new Error('Partida não encontrada.');
+    }
+    if (!allowedStatuses.includes(currentMatch.status)) {
+      throw new Error('Transição inválida para partida com status ' + currentMatch.status + '.');
+    }
+
+    const statuses = {
+      ...((data.statuses as Record<string, Match['status']>) || {})
+    };
+    const updatedMatch = { ...currentMatch, ...updates };
+    statuses[matchId] = updatedMatch.status;
+
+    transaction.set(docRef, {
+      ...data,
+      list: list.map((match) => match.id === matchId ? updatedMatch : match),
+      statuses
+    });
+  });
 }
 
 /**
@@ -157,19 +202,19 @@ export async function updateMatchInSingleDoc(matchId: string, updates: Partial<M
 export async function createKnockoutMatchInSingleDoc(newMatch: Match): Promise<void> {
   const docRef = doc(db, 'matches', 'all_matches');
   const docSnap = await getDoc(docRef);
-  
+
   if (docSnap.exists()) {
     const data = docSnap.data();
     const list = (data.list as Match[]) || [];
     const statuses = (data.statuses as Record<string, string>) || {};
-    
+
     // Append the new match if it doesn't exist yet
     if (!list.some(m => m.id === newMatch.id)) {
       statuses[newMatch.id] = newMatch.status;
-      await setDoc(docRef, { 
+      await setDoc(docRef, {
         ...data,
-        list: [...list, newMatch], 
-        statuses 
+        list: [...list, newMatch],
+        statuses
       });
     }
   }
@@ -185,43 +230,197 @@ export async function savePrediction(
   awayScore: number,
   locked?: boolean
 ): Promise<void> {
-  const predictionId = `${userId}_${matchId}`;
-  const predictionRef = doc(db, 'predictions', predictionId);
-
-  const prediction: Prediction = {
+  const predictionId = userId + '_' + matchId;
+  const batch = writeBatch(db);
+  const sheetRef = doc(db, 'prediction_sheets', userId);
+  const newPrediction: Prediction = {
     id: predictionId,
     userId,
     matchId,
     homeScore,
     awayScore,
+    locked: locked === true,
   };
 
-  if (locked !== undefined) {
-    prediction.locked = locked;
+  batch.set(sheetRef, {
+    userId,
+    version: 1,
+    predictions: {
+      [matchId]: newPrediction
+    },
+    lastUpdatedMatchId: matchId
+  }, { merge: true });
+
+  if (locked) {
+    const lockedRef = doc(db, 'locked_predictions', predictionId);
+    batch.set(lockedRef, newPrediction);
   }
 
-  await setDoc(predictionRef, prediction, { merge: true });
+  await batch.commit();
 }
 
-/**
- * Fetches a single prediction for a friend. Returns null if permission is denied.
- */
-export async function getFriendPredictionForMatch(
-  friendId: string,
-  matchId: string
-): Promise<Prediction | null> {
-  const predictionId = `${friendId}_${matchId}`;
-  const predictionRef = doc(db, 'predictions', predictionId);
+const userProfileCache = new Map<string, UserProfile>();
+
+export async function getUserProfiles(userIds: string[]): Promise<UserProfile[]> {
+  const uniqueIds = Array.from(new Set(userIds));
+  const missingIds = uniqueIds.filter((userId) => !userProfileCache.has(userId));
+
+  for (let index = 0; index < missingIds.length; index += 25) {
+    const batchIds = missingIds.slice(index, index + 25);
+    const snapshot = await getDocs(
+      query(collection(db, "users"), where(documentId(), "in", batchIds))
+    );
+    snapshot.docs.forEach((document) => {
+      userProfileCache.set(document.id, document.data() as UserProfile);
+    });
+  }
+
+  return uniqueIds.flatMap((userId) => {
+    const profile = userProfileCache.get(userId);
+    return profile ? [profile] : [];
+  });
+}
+
+export async function getVisiblePredictionsForMatch(
+  matchId: string,
+  userIds: string[],
+  lockedOnly: boolean,
+  matchStatus?: string
+): Promise<Prediction[]> {
+  const uniqueIds = Array.from(new Set(userIds));
+  const results: Prediction[] = [];
+
+  // Case A: Match is scheduled (lockedOnly = true)
+  if (lockedOnly || matchStatus === 'scheduled') {
+    const lockedCollection = collection(db, 'locked_predictions');
+    const predictionIds = uniqueIds.map((userId) => userId + '_' + matchId);
+
+    for (let index = 0; index < predictionIds.length; index += 25) {
+      const batchIds = predictionIds.slice(index, index + 25);
+      const lockedQuery = query(lockedCollection, where(documentId(), 'in', batchIds));
+      try {
+        const snapshot = await getDocs(lockedQuery);
+        results.push(...snapshot.docs.map((docSnap) => docSnap.data() as Prediction));
+      } catch (err) {
+        console.warn('Failed reading batch from locked_predictions:', err);
+      }
+    }
+
+    const foundIds = new Set(results.map((prediction) => prediction.id));
+    const missingIds = predictionIds.filter((predictionId) => !foundIds.has(predictionId));
+    const legacyCollection = collection(db, 'predictions');
+
+    for (let index = 0; index < missingIds.length; index += 25) {
+      const batchIds = missingIds.slice(index, index + 25);
+      const legacyQuery = query(
+        legacyCollection,
+        where(documentId(), 'in', batchIds),
+        where('locked', '==', true)
+      );
+      try {
+        const snapshot = await getDocs(legacyQuery);
+        results.push(...snapshot.docs.map((docSnap) => docSnap.data() as Prediction));
+      } catch (err) {
+        console.warn('Failed reading locked legacy predictions:', err);
+      }
+    }
+
+    return results;
+  }
+
+  // Case B: Match is live or finished (after kickoff)
   try {
-    const snap = await getDoc(predictionRef);
-    if (snap.exists()) {
-      return snap.data() as Prediction;
+    const snapRef = doc(db, 'prediction_snapshots', matchId);
+    const snapDoc = await getDoc(snapRef);
+    if (snapDoc.exists()) {
+      const data = snapDoc.data() as PredictionSnapshot;
+      if (data && data.predictions) {
+        uniqueIds.forEach((friendId) => {
+          if (data.predictions[friendId]) {
+            const friendPred = data.predictions[friendId];
+            results.push({
+              id: `${friendId}_${matchId}`,
+              userId: friendId,
+              matchId,
+              homeScore: friendPred.homeScore,
+              awayScore: friendPred.awayScore,
+              locked: true
+            });
+          }
+        });
+      }
+      return results;
     }
   } catch (err) {
-    // Gracefully catch permission errors when the prediction is not locked
-    // or the current user hasn't locked theirs yet
+    console.warn('Failed reading match snapshot, trying legacy predictions fallback:', err);
   }
-  return null;
+
+  // Fallback Case: read from predictions (legacy)
+  const predictionsCollection = collection(db, "predictions");
+  const predictionIds = uniqueIds.map((userId) => `${userId}_${matchId}`);
+  for (let index = 0; index < predictionIds.length; index += 25) {
+    const batchIds = predictionIds.slice(index, index + 25);
+    const predictionsQuery = lockedOnly
+      ? query(
+          predictionsCollection,
+          where(documentId(), "in", batchIds),
+          where("locked", "==", true)
+        )
+      : query(predictionsCollection, where(documentId(), "in", batchIds));
+    try {
+      const snapshot = await getDocs(predictionsQuery);
+      results.push(
+        ...snapshot.docs.map((document) => document.data() as Prediction)
+      );
+    } catch (err) {
+      console.warn('Failed reading batch legacy predictions:', err);
+    }
+  }
+
+  return results;
+}
+
+async function migrateLegacyPredictions(
+  userId: string,
+  legacyRecords: Record<string, Prediction>
+): Promise<void> {
+  const sheetRef = doc(db, 'prediction_sheets', userId);
+
+  for (const [matchId, prediction] of Object.entries(legacyRecords)) {
+    await runTransaction(db, async (transaction) => {
+      const sheetSnapshot = await transaction.get(sheetRef);
+      const sheet = sheetSnapshot.exists()
+        ? sheetSnapshot.data() as PredictionSheet
+        : null;
+
+      if (sheet?.predictions?.[matchId]) {
+        return;
+      }
+
+      transaction.set(sheetRef, {
+        userId,
+        version: 1,
+        predictions: { [matchId]: prediction },
+        migrationComplete: false,
+        lastUpdatedMatchId: matchId
+      }, { merge: true });
+    });
+  }
+
+  await runTransaction(db, async (transaction) => {
+    const sheetSnapshot = await transaction.get(sheetRef);
+    if (sheetSnapshot.exists()) {
+      transaction.set(sheetRef, { migrationComplete: true }, { merge: true });
+      return;
+    }
+
+    transaction.set(sheetRef, {
+      userId,
+      version: 1,
+      predictions: {},
+      migrationComplete: true
+    });
+  });
 }
 
 /**
@@ -229,17 +428,251 @@ export async function getFriendPredictionForMatch(
  * keyed by the matchId.
  */
 export async function getUserPredictions(userId: string): Promise<Record<string, Prediction>> {
-  const predictionsCol = collection(db, 'predictions');
-  const q = query(predictionsCol, where('userId', '==', userId));
-  const snap = await getDocs(q);
+  let existingSheet: PredictionSheet | null = null;
 
-  const records: Record<string, Prediction> = {};
-  snap.docs.forEach((docSnap) => {
+  try {
+    const sheetRef = doc(db, 'prediction_sheets', userId);
+    const sheetSnap = await getDoc(sheetRef);
+
+    if (sheetSnap.exists()) {
+      const data = sheetSnap.data() as PredictionSheet;
+      if (data.version === 1) {
+        existingSheet = data;
+        if (data.migrationComplete === true) {
+          return data.predictions || {};
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Error reading prediction_sheets, falling back to legacy path:', err);
+  }
+
+  const predictionsCol = collection(db, 'predictions');
+  const legacyQuery = query(predictionsCol, where('userId', '==', userId));
+  const legacySnapshot = await getDocs(legacyQuery);
+
+  const legacyRecords: Record<string, Prediction> = {};
+  legacySnapshot.docs.forEach((docSnap) => {
     const pred = docSnap.data() as Prediction;
-    records[pred.matchId] = pred;
+    legacyRecords[pred.matchId] = {
+      id: userId + '_' + pred.matchId,
+      userId,
+      matchId: pred.matchId,
+      homeScore: pred.homeScore,
+      awayScore: pred.awayScore,
+      locked: pred.locked === true
+    };
   });
 
-  return records;
+  const mergedRecords = {
+    ...legacyRecords,
+    ...(existingSheet?.predictions || {})
+  };
+
+  void migrateLegacyPredictions(userId, legacyRecords).catch((migrationErr) => {
+    console.warn('Prediction sheet migration will be retried on the next load:', migrationErr);
+  });
+
+  return mergedRecords;
+}
+
+/**
+ * Creates an immutable snapshot of all user predictions for a given match.
+ * Scans both prediction_sheets and legacy predictions, merges them,
+ * and writes to prediction_snapshots/{matchId}.
+ * The first successfully created snapshot is preserved on every retry.
+ */
+export async function createMatchSnapshot(matchId: string): Promise<void> {
+  const sheetsCol = collection(db, 'prediction_sheets');
+  const sheetsSnap = await getDocs(sheetsCol);
+
+  const predictionsCol = collection(db, 'predictions');
+  const legacyQuery = query(predictionsCol, where('matchId', '==', matchId));
+  const legacySnap = await getDocs(legacyQuery);
+
+  const snapshotPredictions: Record<string, { homeScore: number; awayScore: number }> = {};
+
+  // Process legacy predictions (include unlocked drafts as well, as kickoff has happened)
+  legacySnap.docs.forEach((docSnap) => {
+    const pred = docSnap.data() as Prediction;
+    if (pred && pred.homeScore !== undefined && pred.awayScore !== undefined) {
+      snapshotPredictions[pred.userId] = {
+        homeScore: pred.homeScore,
+        awayScore: pred.awayScore
+      };
+    }
+  });
+
+  // Process prediction sheets (precedence, include drafts)
+  sheetsSnap.docs.forEach((docSnap) => {
+    const sheet = docSnap.data() as PredictionSheet;
+    if (sheet && sheet.predictions && sheet.predictions[matchId]) {
+      const pred = sheet.predictions[matchId];
+      if (pred && pred.homeScore !== undefined && pred.awayScore !== undefined) {
+        snapshotPredictions[sheet.userId] = {
+          homeScore: pred.homeScore,
+          awayScore: pred.awayScore
+        };
+      }
+    }
+  });
+
+  // Process locked_predictions (filtered by matchId)
+  const lockedCol = collection(db, 'locked_predictions');
+  const lockedQuery = query(lockedCol, where('matchId', '==', matchId));
+  const lockedSnap = await getDocs(lockedQuery);
+  lockedSnap.docs.forEach((docSnap) => {
+    const pred = docSnap.data() as Prediction;
+    if (pred && pred.homeScore !== undefined && pred.awayScore !== undefined) {
+      snapshotPredictions[pred.userId] = {
+        homeScore: pred.homeScore,
+        awayScore: pred.awayScore
+      };
+    }
+  });
+
+  const snapshotRef = doc(db, 'prediction_snapshots', matchId);
+  const created = await runTransaction(db, async (transaction) => {
+    const existingSnapshot = await transaction.get(snapshotRef);
+    if (existingSnapshot.exists()) {
+      return false;
+    }
+
+    transaction.set(snapshotRef, {
+      matchId,
+      createdAt: new Date().toISOString(),
+      predictions: snapshotPredictions,
+      version: 1
+    });
+    return true;
+  });
+
+  if (created) {
+    console.log('Created match snapshot for ' + matchId + ' with ' + Object.keys(snapshotPredictions).length + ' predictions.');
+  }
+}
+
+export async function startMatchWithSnapshot(matchId: string): Promise<void> {
+  await transitionMatchStatus(matchId, ['scheduled', 'locking'], {
+    status: 'locking'
+  });
+
+  await createMatchSnapshot(matchId);
+
+  await transitionMatchStatus(matchId, ['locking'], {
+    status: 'live',
+    homeScore: 0,
+    awayScore: 0
+  });
+}
+
+export async function finalizeMatchAndRecalculate(matchId: string): Promise<void> {
+  // Supports live matches that started before snapshots were introduced.
+  await createMatchSnapshot(matchId);
+  await transitionMatchStatus(matchId, ['live', 'finished'], {
+    status: 'finished'
+  });
+  await recalculateAllUserPoints();
+}
+
+/**
+ * Recalculates and updates totalPoints and stats (exactScores, correctResults)
+ * for all users based on all finished matches.
+ * Should be run when a match is finalized.
+ */
+export async function recalculateAllUserPoints(): Promise<void> {
+  const usersCol = collection(db, 'users');
+  const usersSnap = await getDocs(usersCol);
+  const users = usersSnap.docs.map(d => d.data() as UserProfile);
+
+  const allMatches = await getMatches();
+  const finishedMatches = allMatches.filter(m => m.status === 'finished');
+
+  // Load all snapshots in parallel
+  const snapshots: Record<string, Record<string, { homeScore: number; awayScore: number }>> = {};
+  await Promise.all(
+    finishedMatches.map(async (match) => {
+      try {
+        const snapRef = doc(db, 'prediction_snapshots', match.id);
+        const snapDoc = await getDoc(snapRef);
+        if (snapDoc.exists()) {
+          const data = snapDoc.data() as PredictionSnapshot;
+          if (data && data.predictions) {
+            snapshots[match.id] = data.predictions;
+          }
+        }
+      } catch (err) {
+        console.warn(`Could not read snapshot for match ${match.id} during points recalculation:`, err);
+      }
+    })
+  );
+
+  const missingSnapshotIds = finishedMatches
+    .filter((match) => !snapshots[match.id])
+    .map((match) => match.id);
+  if (missingSnapshotIds.length > 0) {
+    throw new Error('Snapshots ausentes para partidas finalizadas: ' + missingSnapshotIds.join(', '));
+  }
+
+  let batch = writeBatch(db);
+  let counter = 0;
+
+  for (const user of users) {
+    let totalPoints = 0;
+    let exactScores = 0;
+    let correctResults = 0;
+
+    finishedMatches.forEach((match) => {
+      const pred = snapshots[match.id][user.id];
+
+      const homeScore = match.homeScore;
+      const awayScore = match.awayScore;
+
+      if (
+        pred &&
+        homeScore !== undefined &&
+        awayScore !== undefined &&
+        homeScore !== null &&
+        awayScore !== null
+      ) {
+        const points = calculatePoints(
+          pred.homeScore,
+          pred.awayScore,
+          homeScore,
+          awayScore
+        );
+        totalPoints += points;
+
+        if (points === 5) {
+          exactScores += 1;
+        } else if (points >= 2) {
+          correctResults += 1;
+        }
+      }
+    });
+
+    const userRef = doc(db, 'users', user.id);
+    batch.update(userRef, {
+      totalPoints,
+      stats: {
+        exactScores,
+        correctResults
+      }
+    });
+
+    counter++;
+    if (counter === 500) {
+      await batch.commit();
+      batch = writeBatch(db);
+      counter = 0;
+    }
+  }
+
+  if (counter > 0) {
+    await batch.commit();
+  }
+
+  console.log(`Recalculated points and stats for ${users.length} users in chunks.`);
 }
 
 /**
@@ -360,45 +793,78 @@ export async function getLeaderboard(groupId?: string): Promise<UserProfile[]> {
     return users.sort((a, b) => b.totalPoints - a.totalPoints);
   }
 
-  // 3. Fetch predictions for active live matches
-  const liveMatchIds = liveMatches.map((m) => m.id);
-  let livePredictions: Prediction[] = [];
-
-  if (liveMatchIds.length > 0) {
-    const predictionsCol = collection(db, 'predictions');
-    const q = query(predictionsCol, where('matchId', 'in', liveMatchIds));
-    const snap = await getDocs(q);
-    livePredictions = snap.docs.map((d) => d.data() as Prediction);
-  }
-
-  // 4. Calculate live points for each user
+  // Calculate live points for each user
   const userLivePoints: Record<string, number> = {};
   users.forEach((u) => {
     userLivePoints[u.id] = 0;
   });
 
-  livePredictions.forEach((pred) => {
-    const match = liveMatches.find((m) => m.id === pred.matchId);
-    if (
-      match &&
-      match.homeScore !== undefined &&
-      match.awayScore !== undefined &&
-      match.homeScore !== null &&
-      match.awayScore !== null
-    ) {
-      const points = calculatePoints(
-        pred.homeScore,
-        pred.awayScore,
-        match.homeScore,
-        match.awayScore
-      );
-      if (userLivePoints[pred.userId] !== undefined) {
-        userLivePoints[pred.userId] += points;
-      }
-    }
-  });
+  // Fetch predictions for active live matches via snapshots in parallel, with legacy fallback
+  await Promise.all(
+    liveMatches.map(async (match) => {
+      let matchPredictions: Record<string, { homeScore: number; awayScore: number }> = {};
+      let snapshotFound = false;
 
-  // 5. Add live points to totalPoints and sort
+      try {
+        const snapRef = doc(db, 'prediction_snapshots', match.id);
+        const snapDoc = await getDoc(snapRef);
+        if (snapDoc.exists()) {
+          const data = snapDoc.data() as PredictionSnapshot;
+          if (data && data.predictions) {
+            matchPredictions = data.predictions;
+            snapshotFound = true;
+          }
+        }
+      } catch (err) {
+        console.warn(`Failed reading snapshot for live match ${match.id}, falling back to legacy predictions:`, err);
+      }
+
+      if (!snapshotFound) {
+        // Fallback to legacy predictions query for this match
+        try {
+          const predictionsCol = collection(db, 'predictions');
+          const q = query(predictionsCol, where('matchId', '==', match.id));
+          const snap = await getDocs(q);
+          snap.docs.forEach((d) => {
+            const pred = d.data() as Prediction;
+            if (pred && pred.userId) {
+              matchPredictions[pred.userId] = {
+                homeScore: pred.homeScore,
+                awayScore: pred.awayScore
+              };
+            }
+          });
+        } catch (fallbackErr) {
+          console.error(`Failed fallback query for match ${match.id}:`, fallbackErr);
+        }
+      }
+
+      // Calculate temporary live points for each user based on this live match's current score
+      const homeScore = match.homeScore;
+      const awayScore = match.awayScore;
+      if (
+        homeScore !== undefined &&
+        awayScore !== undefined &&
+        homeScore !== null &&
+        awayScore !== null
+      ) {
+        users.forEach((user) => {
+          const pred = matchPredictions[user.id];
+          if (pred) {
+            const points = calculatePoints(
+              pred.homeScore,
+              pred.awayScore,
+              homeScore,
+              awayScore
+            );
+            userLivePoints[user.id] += points;
+          }
+        });
+      }
+    })
+  );
+
+  // Add live points to totalPoints and sort
   const liveLeaderboard = users.map((user) => ({
     ...user,
     totalPoints: user.totalPoints + (userLivePoints[user.id] || 0),

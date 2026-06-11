@@ -1,44 +1,78 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-  
+
     // Helper: Verifica se o usuário está autenticado
     function isAuth() {
       return request.auth != null;
     }
-    
+
     // Helper: Obtém dados do usuário logado
     function getUserData(userId) {
       return get(/databases/$(database)/documents/users/$(userId)).data;
     }
-    
+
     // Helper: Verifica se o usuário logado é um administrador
     function isAdmin() {
-      return isAuth() && (
-        // Caso o banco esteja vazio (primeiro cadastro), permite a ação administrativa de criação
-        !exists(/databases/$(database)/documents/users/$(request.auth.uid)) ||
-        getUserData(request.auth.uid).role == 'admin'
-      );
+      return isAuth() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        getUserData(request.auth.uid).role == 'admin';
+    }
+
+    function matchStatusIs(matchId, status) {
+      return exists(/databases/$(database)/documents/matches/all_matches) &&
+        matchId in get(/databases/$(database)/documents/matches/all_matches).data.statuses &&
+        get(/databases/$(database)/documents/matches/all_matches).data.statuses[matchId] == status;
+    }
+
+    // Partidas agendadas aceitam gravações normais de palpites.
+    function matchIsScheduled(matchId) {
+      return matchStatusIs(matchId, 'scheduled');
+    }
+
+    function matchIsKnownAndNotLocking(matchId) {
+      return exists(/databases/$(database)/documents/matches/all_matches) &&
+        matchId in get(/databases/$(database)/documents/matches/all_matches).data.statuses &&
+        get(/databases/$(database)/documents/matches/all_matches).data.statuses[matchId] != 'locking';
+    }
+
+    function matchPredictionsArePublic(matchId) {
+      return matchStatusIs(matchId, 'live') || matchStatusIs(matchId, 'finished');
+    }
+
+    function userHasLockedPrediction(matchId) {
+      let newPath = /databases/$(database)/documents/locked_predictions/$(request.auth.uid + "_" + matchId);
+      let legacyPath = /databases/$(database)/documents/predictions/$(request.auth.uid + "_" + matchId);
+      return (exists(newPath) && get(newPath).data.locked == true) ||
+        (exists(legacyPath) && get(legacyPath).data.locked == true);
     }
 
     // --- REGRAS PARA USUÁRIOS ---
     match /users/{userId} {
       allow read: if isAuth();
-      
-      // Qualquer usuário autenticado pode criar seu próprio perfil inicial
-      allow create: if isAuth() && request.auth.uid == userId;
-      
+
+      // Qualquer usuário autenticado pode criar seu próprio perfil inicial, mas com pontuação zerada
+      // e papel de 'user' (ou 'admin' apenas no primeiro bootstrap do sistema).
+      allow create: if isAuth() && request.auth.uid == userId &&
+        request.resource.data.totalPoints == 0 &&
+        request.resource.data.stats.exactScores == 0 &&
+        request.resource.data.stats.correctResults == 0 &&
+        (
+          request.resource.data.role == 'user' ||
+          (!exists(/databases/$(database)/documents/matches/all_matches) && request.resource.data.role == 'admin')
+        );
+
       // Atualização de perfil:
       // - Administradores podem atualizar qualquer usuário (necessário para recalcular pontos)
       // - O próprio usuário pode atualizar suas informações comuns (como displayName),
-      //   mas é terminantemente PROIBIDO alterar 'role' ou 'totalPoints'
+      //   mas é terminantemente PROIBIDO alterar 'role' ou 'totalPoints' ou 'stats'
       allow update: if isAuth() && (
         isAdmin() || (
           request.auth.uid == userId &&
-          (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'totalPoints']))
+          (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'totalPoints', 'stats']))
         )
       );
-      
+
       allow delete: if isAdmin();
     }
 
@@ -51,11 +85,6 @@ service cloud.firestore {
 
     // --- REGRAS PARA PALPITES (PREDICTIONS) ---
     match /predictions/{predId} {
-      function matchIsScheduled(matchId) {
-        return exists(/databases/$(database)/documents/matches/all_matches) &&
-          matchId in get(/databases/$(database)/documents/matches/all_matches).data.statuses &&
-          get(/databases/$(database)/documents/matches/all_matches).data.statuses[matchId] == "scheduled";
-      }
 
       function predictionIdIsValid(userId, matchId) {
         return predId == userId + "_" + matchId;
@@ -73,14 +102,12 @@ service cloud.firestore {
       }
 
       allow read: if isAuth() && (
+        isAdmin() ||
         resource.data.userId == request.auth.uid ||
-        !matchIsScheduled(resource.data.matchId) ||
-        (
-          "locked" in resource.data &&
+        matchPredictionsArePublic(resource.data.matchId) ||
+        ("locked" in resource.data &&
           resource.data.locked == true &&
-          exists(/databases/$(database)/documents/predictions/$(request.auth.uid + "_" + resource.data.matchId)) &&
-          get(/databases/$(database)/documents/predictions/$(request.auth.uid + "_" + resource.data.matchId)).data.locked == true
-        )
+          userHasLockedPrediction(resource.data.matchId))
       );
 
       allow create: if isAuth() &&
@@ -108,13 +135,135 @@ service cloud.firestore {
         existingPredictionIsUnlocked();
     }
 
+    // --- REGRAS PARA PLANILHAS DE PALPITES (PREDICTION SHEETS) ---
+    match /prediction_sheets/{userId} {
+      function validateWrittenPrediction(matchId) {
+        let pred = request.resource.data.predictions[matchId];
+        return pred.id == userId + '_' + matchId &&
+          pred.userId == userId &&
+          pred.matchId == matchId &&
+          pred.homeScore is int && pred.homeScore >= 0 &&
+          pred.awayScore is int && pred.awayScore >= 0 &&
+          pred.locked is bool &&
+          pred.keys().hasOnly(['id', 'userId', 'matchId', 'homeScore', 'awayScore', 'locked']);
+      }
+
+      function matchesLegacyPrediction(matchId) {
+        let legacyPath = /databases/$(database)/documents/predictions/$(userId + "_" + matchId);
+        let pred = request.resource.data.predictions[matchId];
+        return exists(legacyPath) &&
+          get(legacyPath).data.userId == userId &&
+          get(legacyPath).data.matchId == matchId &&
+          get(legacyPath).data.homeScore == pred.homeScore &&
+          get(legacyPath).data.awayScore == pred.awayScore;
+      }
+
+      function writtenMatchIdIsValid() {
+        let matchId = request.resource.data.lastUpdatedMatchId;
+        return matchId is string &&
+          request.resource.data.predictions.keys().hasAny([matchId]) &&
+          validateWrittenPrediction(matchId);
+      }
+
+      function writtenPredictionIsAllowed() {
+        let matchId = request.resource.data.lastUpdatedMatchId;
+        return (
+          matchIsScheduled(matchId) &&
+          (!resource.data.predictions.keys().hasAny([matchId]) ||
+            resource.data.predictions[matchId].locked != true)
+        ) || (
+          !resource.data.predictions.keys().hasAny([matchId]) &&
+          matchesLegacyPrediction(matchId)
+        );
+      }
+
+      function createsOnePrediction() {
+        let matchId = request.resource.data.lastUpdatedMatchId;
+        return request.resource.data.predictions.keys().hasOnly([matchId]) &&
+          writtenMatchIdIsValid() &&
+          (matchIsScheduled(matchId) || matchesLegacyPrediction(matchId));
+      }
+
+      function createsCompletedEmptySheet() {
+        return request.resource.data.predictions.size() == 0 &&
+          request.resource.data.migrationComplete == true &&
+          !request.resource.data.keys().hasAny(['lastUpdatedMatchId']);
+      }
+
+      function updatesOnePrediction() {
+        let matchId = request.resource.data.lastUpdatedMatchId;
+        return request.resource.data.predictions.diff(resource.data.predictions).affectedKeys().hasOnly([matchId]) &&
+          request.resource.data.predictions.diff(resource.data.predictions).affectedKeys().size() == 1 &&
+          writtenMatchIdIsValid() &&
+          writtenPredictionIsAllowed();
+      }
+
+      function onlyCompletesMigration() {
+        return request.resource.data.predictions == resource.data.predictions &&
+          request.resource.data.migrationComplete == true;
+      }
+
+      allow read: if isAuth() && (request.auth.uid == userId || isAdmin());
+      allow create: if isAuth() &&
+        request.auth.uid == userId &&
+        request.resource.data.userId == userId &&
+        request.resource.data.version == 1 &&
+        request.resource.data.keys().hasOnly(['userId', 'version', 'predictions', 'migrationComplete', 'lastUpdatedMatchId']) &&
+        (createsOnePrediction() || createsCompletedEmptySheet());
+      allow update: if isAuth() &&
+        request.auth.uid == userId &&
+        request.resource.data.userId == resource.data.userId &&
+        request.resource.data.version == resource.data.version &&
+        request.resource.data.keys().hasOnly(['userId', 'version', 'predictions', 'migrationComplete', 'lastUpdatedMatchId']) &&
+        (updatesOnePrediction() || onlyCompletesMigration());
+      allow delete: if isAdmin();
+    }
+
+    // --- REGRAS PARA PALPITES TRANCADOS (LOCKED PREDICTIONS) ---
+    match /locked_predictions/{predId} {
+
+      allow read: if isAuth() && (
+        isAdmin() ||
+        resource.data.userId == request.auth.uid ||
+        matchPredictionsArePublic(resource.data.matchId) ||
+        (resource.data.locked == true &&
+          userHasLockedPrediction(resource.data.matchId))
+      );
+
+      allow create: if isAuth() &&
+        request.resource.data.userId == request.auth.uid &&
+        predId == request.resource.data.userId + '_' + request.resource.data.matchId &&
+        request.resource.data.id == predId &&
+        request.resource.data.homeScore is int && request.resource.data.homeScore >= 0 &&
+        request.resource.data.awayScore is int && request.resource.data.awayScore >= 0 &&
+        request.resource.data.locked == true &&
+        request.resource.data.keys().hasOnly(['id', 'userId', 'matchId', 'homeScore', 'awayScore', 'locked']) &&
+        matchIsScheduled(request.resource.data.matchId);
+
+      // Permite apenas repetição idempotente da mesma gravação travada.
+      allow update: if isAuth() &&
+        resource.data.userId == request.auth.uid &&
+        request.resource.data == resource.data;
+      allow delete: if false; // Trancado é definitivo
+    }
+
+    // --- REGRAS PARA SNAPSHOTS DE PARTIDAS (PREDICTION SNAPSHOTS) ---
+    match /prediction_snapshots/{matchId} {
+      allow read: if isAuth() && (isAdmin() || matchPredictionsArePublic(matchId));
+      allow create: if isAdmin() &&
+        request.resource.data.matchId == matchId &&
+        request.resource.data.version == 1 &&
+        request.resource.data.keys().hasOnly(['matchId', 'createdAt', 'predictions', 'version']);
+      allow update, delete: if false;
+    }
+
     // --- REGRAS PARA GRUPOS ---
     match /groups/{groupId} {
       allow read: if isAuth();
-      
+
       // Criação de grupo: o criadorId deve ser o usuário logado
       allow create: if isAuth() && request.resource.data.creatorId == request.auth.uid;
-      
+
       // Edição de grupo:
       // - O criador pode alterar o grupo
       // - Qualquer usuário pode atualizar APENAS a lista de membros para adicionar a si mesmo (ingresso por código)
@@ -127,7 +276,7 @@ service cloud.firestore {
           request.auth.uid in request.resource.data.members
         )
       );
-      
+
       allow delete: if isAuth() && resource.data.creatorId == request.auth.uid;
     }
   }

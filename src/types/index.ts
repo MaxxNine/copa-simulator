@@ -22,7 +22,7 @@ export interface Match {
   group: string; // e.g. 'Group A', 'Group B', ..., 'Group L'
   matchday: number; // 1, 2, 3 for group stage, and knockout stages afterwards (e.g. 4 for Round of 32, 5 for Round of 16, etc.)
   date: string; // ISO string format
-  status: 'scheduled' | 'live' | 'finished';
+  status: 'scheduled' | 'locking' | 'live' | 'finished';
   homeScore?: number;
   awayScore?: number;
 }
@@ -35,6 +35,23 @@ export interface Prediction {
   awayScore: number;
   pointsEarned?: number; // Optional, useful for calculating score later
   locked?: boolean;
+}
+
+export interface PredictionSheet {
+  userId: string;
+  version: number;
+  predictions: Record<string, Prediction>; // keyed by matchId
+  migrationComplete?: boolean;
+  lastUpdatedMatchId?: string;
+}
+
+export interface PredictionSnapshot {
+  matchId: string;
+  createdAt: string;
+  predictions: Record<string, {
+    homeScore: number;
+    awayScore: number;
+  }>; // keyed by userId
 }
 
 export interface Group {

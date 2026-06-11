@@ -1,9 +1,14 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { Match, UserProfile } from '../types';
-import { Play, Square, Save, Plus, Calendar, ShieldAlert, Sparkles, RefreshCw, CheckCircle } from 'lucide-react';
-import { updateMatchInSingleDoc, createKnockoutMatchInSingleDoc } from '../lib/db';
+import { Play, Square, Plus, ShieldAlert, Sparkles, RefreshCw, CheckCircle } from 'lucide-react';
+import {
+  updateMatchInSingleDoc,
+  createKnockoutMatchInSingleDoc,
+  startMatchWithSnapshot,
+  finalizeMatchAndRecalculate
+} from '../lib/db';
 
 interface AdminTabProps {
   currentUser: UserProfile | null;
@@ -11,8 +16,20 @@ interface AdminTabProps {
   onMatchesUpdated?: () => void;
 }
 
+const MOCK_MATCHES: Match[] = [
+  { id: 'm1', homeTeam: 'Brasil', awayTeam: 'Suíça', homeFlag: '🇧🇷', awayFlag: '🇨🇭', group: 'Group G', matchday: 1, date: '2026-06-11T16:00:00Z', status: 'finished', homeScore: 2, awayScore: 0 },
+  { id: 'm2', homeTeam: 'Espanha', awayTeam: 'Alemanha', homeFlag: '🇪🇸', awayFlag: '🇩🇪', group: 'Group E', matchday: 1, date: '2026-06-11T19:00:00Z', status: 'live', homeScore: 1, awayScore: 1 },
+  { id: 'm3', homeTeam: 'EUA', awayTeam: 'México', homeFlag: '🇺🇸', awayFlag: '🇲🇽', group: 'Group A', matchday: 1, date: '2026-06-12T13:00:00Z', status: 'scheduled' },
+  { id: 'm4', homeTeam: 'França', awayTeam: 'Dinamarca', homeFlag: '🇫🇷', awayFlag: '🇩🇰', group: 'Group D', matchday: 1, date: '2026-06-12T16:00:00Z', status: 'scheduled' },
+];
+
+function getErrorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
+
 export default function AdminTab({ currentUser, matches: initialMatches, onMatchesUpdated }: AdminTabProps) {
-  const [matches, setMatches] = useState<Match[]>([]);
+  const [localMatches, setLocalMatches] = useState<Match[]>(MOCK_MATCHES);
+  const matches = initialMatches.length > 0 ? initialMatches : localMatches;
   const [activeTab, setActiveTab] = useState<'scores' | 'knockout'>('scores');
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('all');
@@ -29,21 +46,6 @@ export default function AdminTab({ currentUser, matches: initialMatches, onMatch
   const [actionLoading, setActionLoading] = useState<Record<string, boolean>>({});
   const [adminMessage, setAdminMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
-  useEffect(() => {
-    if (initialMatches && initialMatches.length > 0) {
-      setMatches(initialMatches);
-    } else {
-      // Load mock matches
-      const mockMatches: Match[] = [
-        { id: 'm1', homeTeam: 'Brasil', awayTeam: 'Suíça', homeFlag: '🇧🇷', awayFlag: '🇨🇭', group: 'Group G', matchday: 1, date: '2026-06-11T16:00:00Z', status: 'finished', homeScore: 2, awayScore: 0 },
-        { id: 'm2', homeTeam: 'Espanha', awayTeam: 'Alemanha', homeFlag: '🇪🇸', awayFlag: '🇩🇪', group: 'Group E', matchday: 1, date: '2026-06-11T19:00:00Z', status: 'live', homeScore: 1, awayScore: 1 },
-        { id: 'm3', homeTeam: 'EUA', awayTeam: 'México', homeFlag: '🇺🇸', awayFlag: '🇲🇽', group: 'Group A', matchday: 1, date: '2026-06-12T13:00:00Z', status: 'scheduled' },
-        { id: 'm4', homeTeam: 'França', awayTeam: 'Dinamarca', homeFlag: '🇫🇷', awayFlag: '🇩🇰', group: 'Group D', matchday: 1, date: '2026-06-12T16:00:00Z', status: 'scheduled' },
-      ];
-      setMatches(mockMatches);
-    }
-  }, [initialMatches]);
-
   // Clean messaging
   const showMessage = (type: 'success' | 'error', text: string) => {
     setAdminMessage({ type, text });
@@ -55,20 +57,16 @@ export default function AdminTab({ currentUser, matches: initialMatches, onMatch
     setActionLoading(prev => ({ ...prev, [matchId]: true }));
     try {
       if (currentUser?.role === 'admin') {
-        await updateMatchInSingleDoc(matchId, {
-          status: 'live',
-          homeScore: 0,
-          awayScore: 0
-        });
+        await startMatchWithSnapshot(matchId);
         showMessage('success', 'Partida iniciada ao vivo!');
         if (onMatchesUpdated) onMatchesUpdated();
       } else {
         // Mock UI Update
-        setMatches(prev => prev.map(m => m.id === matchId ? { ...m, status: 'live', homeScore: 0, awayScore: 0 } : m));
+        setLocalMatches(prev => prev.map(m => m.id === matchId ? { ...m, status: 'live', homeScore: 0, awayScore: 0 } : m));
         showMessage('success', '[MOCK] Partida iniciada ao vivo com placar 0x0!');
       }
-    } catch (err: any) {
-      showMessage('error', err.message || 'Erro ao iniciar partida.');
+    } catch (error: unknown) {
+      showMessage('error', getErrorMessage(error, 'Erro ao iniciar partida.'));
     } finally {
       setActionLoading(prev => ({ ...prev, [matchId]: false }));
     }
@@ -91,7 +89,7 @@ export default function AdminTab({ currentUser, matches: initialMatches, onMatch
         if (onMatchesUpdated) onMatchesUpdated();
       } else {
         // Mock UI Update
-        setMatches(prev => prev.map(m => {
+        setLocalMatches(prev => prev.map(m => {
           if (m.id === matchId) {
             return {
               ...m,
@@ -101,8 +99,8 @@ export default function AdminTab({ currentUser, matches: initialMatches, onMatch
           return m;
         }));
       }
-    } catch (err: any) {
-      showMessage('error', err.message || 'Erro ao atualizar gols.');
+    } catch (error: unknown) {
+      showMessage('error', getErrorMessage(error, 'Erro ao atualizar gols.'));
     } finally {
       setActionLoading(prev => ({ ...prev, [`${matchId}_score`]: false }));
     }
@@ -113,22 +111,17 @@ export default function AdminTab({ currentUser, matches: initialMatches, onMatch
     setActionLoading(prev => ({ ...prev, [matchId]: true }));
     try {
       if (currentUser?.role === 'admin') {
-        // Live Database Integration
-        await updateMatchInSingleDoc(matchId, {
-          status: 'finished'
-        });
+        await finalizeMatchAndRecalculate(matchId);
 
-        // Points distribution is handled reactively or we could write a function.
-        // For the sake of the dashboard simulation, the admin finalizing triggers it:
-        showMessage('success', 'Partida finalizada! Placar gravado com sucesso.');
+        showMessage('success', 'Partida finalizada! Placar gravado com sucesso e pontuações recalculadas.');
         if (onMatchesUpdated) onMatchesUpdated();
       } else {
         // Mock UI update
-        setMatches(prev => prev.map(m => m.id === matchId ? { ...m, status: 'finished' } : m));
+        setLocalMatches(prev => prev.map(m => m.id === matchId ? { ...m, status: 'finished' } : m));
         showMessage('success', '[MOCK] Partida finalizada! Pontos dos palpites calculados.');
       }
-    } catch (err: any) {
-      showMessage('error', err.message || 'Erro ao finalizar partida.');
+    } catch (error: unknown) {
+      showMessage('error', getErrorMessage(error, 'Erro ao finalizar partida.'));
     } finally {
       setActionLoading(prev => ({ ...prev, [matchId]: false }));
     }
@@ -169,7 +162,7 @@ export default function AdminTab({ currentUser, matches: initialMatches, onMatch
         if (onMatchesUpdated) onMatchesUpdated();
       } else {
         // Mock UI Update
-        setMatches(prev => [...prev, newMatch]);
+        setLocalMatches(prev => [...prev, newMatch]);
         showMessage('success', `[MOCK] Partida criada: ${homeTeam} vs ${awayTeam} no Mata-Mata!`);
       }
       // Reset form
@@ -178,8 +171,8 @@ export default function AdminTab({ currentUser, matches: initialMatches, onMatch
       setHomeFlag('🏳️');
       setAwayFlag('🏳️');
       setActiveTab('scores');
-    } catch (err: any) {
-      showMessage('error', err.message || 'Erro ao criar partida.');
+    } catch (error: unknown) {
+      showMessage('error', getErrorMessage(error, 'Erro ao criar partida.'));
     } finally {
       setActionLoading(prev => ({ ...prev, create: false }));
     }
@@ -338,6 +331,11 @@ export default function AdminTab({ currentUser, matches: initialMatches, onMatch
                             Agendado
                           </span>
                         )}
+                        {match.status === 'locking' && (
+                          <span className="text-xs bg-amber-100 text-amber-700 px-2.5 py-1 rounded-full font-bold">
+                            Fechando palpites
+                          </span>
+                        )}
                         {match.status === 'live' && (
                           <span className="text-xs bg-red-100 text-red-600 px-2.5 py-1 rounded-full font-bold animate-pulse">
                             Ao Vivo
@@ -368,6 +366,7 @@ export default function AdminTab({ currentUser, matches: initialMatches, onMatch
                             <div className="flex items-center gap-2">
                               <button
                                 onClick={() => handleAdjustGoal(match.id, 'home', -1)}
+                                disabled={isLoadingScore}
                                 className="h-7 w-7 bg-slate-100 rounded-lg font-bold flex items-center justify-center text-slate-600 hover:bg-slate-200"
                               >
                                 -
@@ -377,6 +376,7 @@ export default function AdminTab({ currentUser, matches: initialMatches, onMatch
                               </span>
                               <button
                                 onClick={() => handleAdjustGoal(match.id, 'home', 1)}
+                                disabled={isLoadingScore}
                                 className="h-7 w-7 bg-slate-100 rounded-lg font-bold flex items-center justify-center text-slate-600 hover:bg-slate-200"
                               >
                                 +
@@ -394,6 +394,7 @@ export default function AdminTab({ currentUser, matches: initialMatches, onMatch
                             <div className="flex items-center gap-2">
                               <button
                                 onClick={() => handleAdjustGoal(match.id, 'away', -1)}
+                                disabled={isLoadingScore}
                                 className="h-7 w-7 bg-slate-100 rounded-lg font-bold flex items-center justify-center text-slate-600 hover:bg-slate-200"
                               >
                                 -
@@ -403,6 +404,7 @@ export default function AdminTab({ currentUser, matches: initialMatches, onMatch
                               </span>
                               <button
                                 onClick={() => handleAdjustGoal(match.id, 'away', 1)}
+                                disabled={isLoadingScore}
                                 className="h-7 w-7 bg-slate-100 rounded-lg font-bold flex items-center justify-center text-slate-600 hover:bg-slate-200"
                               >
                                 +
@@ -424,14 +426,14 @@ export default function AdminTab({ currentUser, matches: initialMatches, onMatch
 
                       {/* Right: Actions */}
                       <div className="flex justify-center md:justify-end gap-2 shrink-0">
-                        {match.status === 'scheduled' && (
+                        {(match.status === 'scheduled' || match.status === 'locking') && (
                           <button
                             onClick={() => handleStartMatch(match.id)}
                             disabled={isLoadingStart}
                             className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold py-2.5 px-4 rounded-xl shadow-sm hover:shadow flex items-center gap-1.5 transition-all"
                           >
                             <Play className="h-3.5 w-3.5 fill-white" />
-                            Iniciar Jogo
+                            {match.status === 'locking' ? 'Retomar Início' : 'Iniciar Jogo'}
                           </button>
                         )}
                         {match.status === 'live' && (
@@ -445,9 +447,14 @@ export default function AdminTab({ currentUser, matches: initialMatches, onMatch
                           </button>
                         )}
                         {match.status === 'finished' && (
-                          <span className="text-slate-400 text-xs italic font-medium px-4">
-                            Sem ações pendentes
-                          </span>
+                          <button
+                            onClick={() => handleFinalizeMatch(match.id)}
+                            disabled={isLoadingStart}
+                            className="bg-slate-700 hover:bg-slate-800 text-white text-xs font-bold py-2.5 px-4 rounded-xl shadow-sm flex items-center gap-1.5 transition-all"
+                          >
+                            <RefreshCw className={isLoadingStart ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} />
+                            Recalcular Pontos
+                          </button>
                         )}
                       </div>
 

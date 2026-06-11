@@ -1,11 +1,13 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useRef } from 'react';
 import { Match, Prediction, UserProfile } from '../types';
 import { calculatePoints } from '../utils/points';
-import { Calendar, Search, Award, Check, RefreshCw, ChevronRight, AlertCircle, Plus, Minus, Lock, Unlock, Users } from 'lucide-react';
-import { savePrediction, getUserPredictions, getUserGroups, getGroupMembers, getFriendPredictionForMatch } from '../lib/db';
+import { Calendar, Award, Check, RefreshCw, ChevronRight, AlertCircle, Plus, Minus, Lock, Users } from 'lucide-react';
+import { savePrediction, getUserGroups, getUserProfiles, getVisiblePredictionsForMatch } from '../lib/db';
 import { generateGroupStageMatches } from '../utils/seeds/matchesSeed';
+
+const FALLBACK_MATCHES = generateGroupStageMatches();
 
 interface PalpitesTabProps {
   currentUser: UserProfile | null;
@@ -22,8 +24,8 @@ export default function PalpitesTab({
   onPredictionSaved,
   isLoading: externalLoading = false,
 }: PalpitesTabProps) {
-  const [matches, setMatches] = useState<Match[]>([]);
-  const [predictions, setPredictions] = useState<Record<string, Prediction>>({});
+  const matches = initialMatches.length > 0 ? initialMatches : FALLBACK_MATCHES;
+  const predictions = initialPredictions;
   const [activeTab, setActiveTab] = useState<number>(1); // 1, 2, 3 for group stage, 4 for Mata-Mata
   const [selectedGroup, setSelectedGroup] = useState<string>('Todos');
   const [localScores, setLocalScores] = useState<Record<string, { home: number; away: number }>>({});
@@ -32,6 +34,7 @@ export default function PalpitesTab({
   // Group friends predictions states
   const [friends, setFriends] = useState<UserProfile[]>([]);
   const [loadingFriends, setLoadingFriends] = useState(false);
+  const friendsPromise = useRef<Promise<UserProfile[]> | null>(null);
   const [expandedMatchPredictions, setExpandedMatchPredictions] = useState<Record<string, boolean>>({});
   const [friendPredictions, setFriendPredictions] = useState<Record<string, Record<string, Prediction | null>>>({});
   const [loadingFriendPreds, setLoadingFriendPreds] = useState<Record<string, boolean>>({});
@@ -48,8 +51,15 @@ export default function PalpitesTab({
     awayScore: number;
   } | null>(null);
 
+  const getScore = (matchId: string) => {
+    const prediction = predictions[matchId];
+    return localScores[matchId] ?? (prediction
+      ? { home: prediction.homeScore, away: prediction.awayScore }
+      : { home: 0, away: 0 });
+  };
+
   const promptLockMatch = (match: Match) => {
-    const score = localScores[match.id] || { home: 0, away: 0 };
+    const score = getScore(match.id);
     setLockConfirmModal({
       isOpen: true,
       matchId: match.id,
@@ -62,91 +72,80 @@ export default function PalpitesTab({
     });
   };
 
-  // Load friends (members of groups user belongs to)
-  useEffect(() => {
-    const loadFriends = async () => {
-      if (!currentUser) return;
-      setLoadingFriends(true);
-      try {
-        const groups = await getUserGroups(currentUser.id);
-        const membersMap: Record<string, UserProfile> = {};
-        for (const grp of groups) {
-          const members = await getGroupMembers(grp.id);
-          members.forEach((m) => {
-            if (m.id !== currentUser.id) {
-              membersMap[m.id] = m;
-            }
-          });
-        }
-        setFriends(Object.values(membersMap));
-      } catch (err) {
-        console.error('Error loading friends list:', err);
-      } finally {
-        setLoadingFriends(false);
-      }
-    };
-    loadFriends();
-  }, [currentUser]);
+  const loadFriends = async (): Promise<UserProfile[]> => {
+    if (!currentUser) return [];
+    if (friends.length > 0) return friends;
+    if (friendsPromise.current) return friendsPromise.current;
 
-  // Toggle show/hide of friend predictions
-  const toggleMatchPredictions = async (matchId: string) => {
-    const isCurrentlyExpanded = expandedMatchPredictions[matchId];
-    
-    // Toggle
-    setExpandedMatchPredictions(prev => ({
-      ...prev,
-      [matchId]: !prev[matchId]
-    }));
+    setLoadingFriends(true);
+    friendsPromise.current = (async () => {
+      const groups = await getUserGroups(currentUser.id);
+      const friendIds = Array.from(
+        new Set(groups.flatMap((group) => group.members))
+      ).filter((userId) => userId !== currentUser.id);
+      const profiles = await getUserProfiles(friendIds);
+      setFriends(profiles);
+      return profiles;
+    })();
 
-    // If expanding and we haven't loaded predictions for this match yet
-    if (!isCurrentlyExpanded && !friendPredictions[matchId] && friends.length > 0) {
-      setLoadingFriendPreds(prev => ({ ...prev, [matchId]: true }));
-      try {
-        const preds: Record<string, Prediction | null> = {};
-        await Promise.all(
-          friends.map(async (friend) => {
-            const pred = await getFriendPredictionForMatch(friend.id, matchId);
-            preds[friend.id] = pred;
-          })
-        );
-        setFriendPredictions(prev => ({
-          ...prev,
-          [matchId]: preds
-        }));
-      } catch (err) {
-        console.error('Error loading friend predictions:', err);
-      } finally {
-        setLoadingFriendPreds(prev => ({ ...prev, [matchId]: false }));
-      }
+    try {
+      return await friendsPromise.current;
+    } catch (error) {
+      friendsPromise.current = null;
+      console.error("Error loading friends list:", error);
+      return [];
+    } finally {
+      setLoadingFriends(false);
     }
   };
 
-  // Populate state with props or fallback mock data
-  useEffect(() => {
-    if (initialMatches && initialMatches.length > 0) {
-      setMatches(initialMatches);
-    } else {
-      // Load generated Portuguese group stage matches as mock if none provided
-      const mockMatches = generateGroupStageMatches();
-      setMatches(mockMatches);
-    }
-  }, [initialMatches]);
+  // Toggle show/hide of friend predictions
+  const toggleMatchPredictions = async (match: Match) => {
+    const matchId = match.id;
+    const isCurrentlyExpanded = expandedMatchPredictions[matchId];
 
-  useEffect(() => {
-    if (initialPredictions && Object.keys(initialPredictions).length > 0) {
-      setPredictions(initialPredictions);
-      // Initialize local scores
-      const scores: Record<string, { home: number; away: number }> = {};
-      Object.entries(initialPredictions).forEach(([matchId, pred]) => {
-        scores[matchId] = { home: pred.homeScore, away: pred.awayScore };
-      });
-      setLocalScores(scores);
-    } else {
-      // Mock empty predictions
-      setPredictions({});
-      setLocalScores({});
+    setExpandedMatchPredictions((current) => ({
+      ...current,
+      [matchId]: !current[matchId],
+    }));
+
+    if (isCurrentlyExpanded || friendPredictions[matchId]) return;
+
+    const ownPrediction = predictions[matchId];
+    if (match.status === 'locking' || (match.status === 'scheduled' && ownPrediction?.locked !== true)) {
+      return;
     }
-  }, [initialPredictions]);
+
+    setLoadingFriendPreds((current) => ({ ...current, [matchId]: true }));
+    try {
+      const loadedFriends = await loadFriends();
+      if (loadedFriends.length === 0) return;
+
+      const visiblePredictions = await getVisiblePredictionsForMatch(
+        matchId,
+        loadedFriends.map((friend) => friend.id),
+        match.status === "scheduled",
+        match.status
+      );
+      const visibleByUser = new Map(
+        visiblePredictions.map((prediction) => [prediction.userId, prediction])
+      );
+      const predictionsByFriend: Record<string, Prediction | null> = {};
+
+      loadedFriends.forEach((friend) => {
+        predictionsByFriend[friend.id] = visibleByUser.get(friend.id) ?? null;
+      });
+
+      setFriendPredictions((current) => ({
+        ...current,
+        [matchId]: predictionsByFriend,
+      }));
+    } catch (error) {
+      console.error("Error loading friend predictions:", error);
+    } finally {
+      setLoadingFriendPreds((current) => ({ ...current, [matchId]: false }));
+    }
+  };
 
   // Adjust score handlers
   const handleScoreChange = (matchId: string, side: 'home' | 'away', amount: number) => {
@@ -186,8 +185,21 @@ export default function PalpitesTab({
   };
 
   const handleSave = async (matchId: string, lock?: boolean) => {
-    const score = localScores[matchId] || { home: 0, away: 0 };
-    
+    const score = getScore(matchId);
+    const existingPrediction = predictions[matchId];
+    const isUnchanged =
+      existingPrediction?.homeScore === score.home &&
+      existingPrediction?.awayScore === score.away &&
+      (lock !== true || existingPrediction.locked === true);
+
+    if (currentUser && isUnchanged) {
+      setSavingStatus((current) => ({ ...current, [matchId]: "saved" }));
+      window.setTimeout(() => {
+        setSavingStatus((current) => ({ ...current, [matchId]: "idle" }));
+      }, 2500);
+      return;
+    }
+
     setSavingStatus(prev => ({ ...prev, [matchId]: 'saving' }));
 
     try {
@@ -244,7 +256,7 @@ export default function PalpitesTab({
         hour: '2-digit',
         minute: '2-digit'
       });
-    } catch (e) {
+    } catch {
       return dateStr;
     }
   };
@@ -336,12 +348,13 @@ export default function PalpitesTab({
         <div className="space-y-4">
           {filteredMatches.map((match) => {
             const pred = predictions[match.id];
-            const score = localScores[match.id] || { home: 0, away: 0 };
+            const score = getScore(match.id);
             const status = savingStatus[match.id] || 'idle';
             const isFinished = match.status === 'finished';
             const isLive = match.status === 'live';
+            const isLocking = match.status === 'locking';
             const isLockedBySelf = pred?.locked === true;
-            const isDisabled = isFinished || isLive || isLockedBySelf;
+            const isDisabled = isFinished || isLive || isLocking || isLockedBySelf;
 
             // Calculate live/earned points if possible
             let pointsText = null;
@@ -393,6 +406,11 @@ export default function PalpitesTab({
                       <span className="text-xs font-bold bg-red-100 text-red-600 px-2.5 py-1 rounded-full animate-pulse flex items-center gap-1">
                         <span className="h-1.5 w-1.5 rounded-full bg-red-600 animate-ping" />
                         Ao Vivo
+                      </span>
+                    )}
+                    {isLocking && (
+                      <span className="text-xs font-bold bg-amber-100 text-amber-700 px-2.5 py-1 rounded-full">
+                        Fechando palpites
                       </span>
                     )}
                     {match.status === 'scheduled' && !isLockedBySelf && (
@@ -498,12 +516,12 @@ export default function PalpitesTab({
                 {!isDisabled && (
                   <div className="mt-4 pt-3 border-t border-slate-100 flex justify-between items-center">
                     {/* Collapsible predictions button */}
-                    {friends.length > 0 ? (
+                    {currentUser ? (
                       <button
-                        onClick={() => toggleMatchPredictions(match.id)}
+                        onClick={() => toggleMatchPredictions(match)}
                         className="text-xs font-bold text-blue-600 hover:text-blue-700 transition-colors flex items-center gap-1 cursor-pointer"
                       >
-                        👥 Palpites do Grupo
+                        {loadingFriends ? 'Carregando amigos...' : '👥 Palpites do Grupo'}
                         <ChevronRight className={`h-3 w-3 transform transition-transform ${expandedMatchPredictions[match.id] ? 'rotate-90' : ''}`} />
                       </button>
                     ) : (
@@ -557,12 +575,12 @@ export default function PalpitesTab({
                         )}
                       </div>
 
-                      {friends.length > 0 && (
+                      {currentUser && (
                         <button
-                          onClick={() => toggleMatchPredictions(match.id)}
+                          onClick={() => toggleMatchPredictions(match)}
                           className="text-xs font-bold text-blue-600 hover:text-blue-700 transition-colors flex items-center gap-1 cursor-pointer"
                         >
-                          👥 Palpites do Grupo
+                          {loadingFriends ? 'Carregando amigos...' : '👥 Palpites do Grupo'}
                           <ChevronRight className={`h-3 w-3 transform transition-transform ${expandedMatchPredictions[match.id] ? 'rotate-90' : ''}`} />
                         </button>
                       )}

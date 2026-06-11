@@ -25,6 +25,8 @@ function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
   ]);
 }
 
+type DashboardTab = "palpites" | "classificacao" | "ranking" | "grupos" | "admin";
+
 export default function Dashboard() {
   const router = useRouter();
   
@@ -39,8 +41,14 @@ export default function Dashboard() {
   const [isDataLoading, setIsDataLoading] = useState(true);
   
   // UI Navigation
-  const [activeTab, setActiveTab] = useState<'palpites' | 'classificacao' | 'ranking' | 'grupos' | 'admin'>('palpites');
+  const [activeTab, setActiveTab] = useState<DashboardTab>("palpites");
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [hasOpenedGroups, setHasOpenedGroups] = useState(false);
+
+  const handleTabChange = (tab: DashboardTab) => {
+    if (tab === "grupos") setHasOpenedGroups(true);
+    setActiveTab(tab);
+  };
 
   // 1. Listen to Authentication State
   useEffect(() => {
@@ -239,7 +247,7 @@ export default function Dashboard() {
               return (
                 <button
                   key={item.id}
-                  onClick={() => setActiveTab(item.id as any)}
+                  onClick={() => handleTabChange(item.id as DashboardTab)}
                   className={`flex items-center gap-2 py-2 px-4 rounded-xl text-sm font-bold transition-all ${
                     activeTab === item.id
                       ? 'bg-blue-50 text-blue-700'
@@ -255,7 +263,7 @@ export default function Dashboard() {
             {/* Admin Tab link */}
             {currentUser?.role === 'admin' && (
               <button
-                onClick={() => setActiveTab('admin')}
+                onClick={() => handleTabChange("admin")}
                 className={`flex items-center gap-2 py-2 px-4 rounded-xl text-sm font-bold transition-all ${
                   activeTab === 'admin'
                     ? 'bg-red-50 text-red-700'
@@ -310,7 +318,7 @@ export default function Dashboard() {
 
       {/* MAIN CONTENT AREA */}
       <main className="flex-1 pb-24 md:pb-6">
-        {activeTab === 'palpites' && (
+        <div className={activeTab === "palpites" ? "block" : "hidden"}>
           <PalpitesTab
             currentUser={currentUser}
             matches={matches}
@@ -318,7 +326,7 @@ export default function Dashboard() {
             onPredictionSaved={handlePredictionSaved}
             isLoading={isDataLoading}
           />
-        )}
+        </div>
         {activeTab === 'classificacao' && (
           <ClassificacaoTab
             matches={matches}
@@ -331,10 +339,10 @@ export default function Dashboard() {
             isLoading={isDataLoading}
           />
         )}
-        {activeTab === 'grupos' && (
-          <GruposTab
-            currentUser={currentUser}
-          />
+        {hasOpenedGroups && (
+          <div className={activeTab === "grupos" ? "block" : "hidden"}>
+            <GruposTab currentUser={currentUser} />
+          </div>
         )}
         {activeTab === 'admin' && currentUser?.role === 'admin' && (
           <AdminTab
@@ -358,7 +366,7 @@ export default function Dashboard() {
           return (
             <button
               key={item.id}
-              onClick={() => setActiveTab(item.id as any)}
+              onClick={() => handleTabChange(item.id as DashboardTab)}
               className={`flex flex-col items-center gap-1 py-1 px-3 text-center transition-all ${
                 isActive ? 'text-blue-600' : 'text-slate-400 hover:text-slate-600'
               }`}
@@ -372,7 +380,7 @@ export default function Dashboard() {
         {/* Admin on Mobile Bottom Nav */}
         {currentUser?.role === 'admin' && (
           <button
-            onClick={() => setActiveTab('admin')}
+            onClick={() => handleTabChange("admin")}
             className={`flex flex-col items-center gap-1 py-1 px-3 text-center transition-all ${
               activeTab === 'admin' ? 'text-red-600' : 'text-slate-400 hover:text-red-500'
             }`}
